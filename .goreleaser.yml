@@ -67,8 +67,3 @@ changelog:
       - "^chore:"
       - "^ci:"
       - "^style:"
-
-release:
-  github:
-    owner: voocel
-    name: ainovel-cli
