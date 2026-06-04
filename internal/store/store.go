@@ -3,9 +3,12 @@ package store
 import (
 	"fmt"
 	"os"
+	"slices"
+	"strconv"
 	"sync"
 
 	"github.com/voocel/ainovel-cli/internal/domain"
+	"github.com/voocel/ainovel-cli/internal/errs"
 )
 
 // Store 是状态管理的组合根，持有所有子存储。
@@ -182,6 +185,189 @@ func (s *Store) AppendVolume(vol domain.VolumeOutline) error {
 	}
 	p.TotalChapters = domain.TotalChapters(volumes)
 	return s.Progress.saveUnlocked(p)
+}
+
+// ReplanFromChapter 从指定章节开始重规划全书。
+// 事务内同时覆盖分层大纲与进度，保证“已完成章节”和“新大纲归属”不会分叉。
+func (s *Store) ReplanFromChapter(fromChapter int, volumes []domain.VolumeOutline, reason string) (affected []int, err error) {
+	if fromChapter < 1 {
+		return nil, fmt.Errorf("fromChapter must be >= 1: %w", errs.ErrToolArgs)
+	}
+
+	s.crossMu.Lock()
+	defer s.crossMu.Unlock()
+
+	checkpointProgress := mustLoadProgress(s)
+	if checkpointProgress != nil {
+		label := "replan-from-" + strconv.Itoa(fromChapter)
+		ts, err := s.RunMeta.SaveCheckpoint(label, checkpointProgress)
+		if err != nil {
+			return nil, err
+		}
+		if err := s.RunMeta.SaveReplanCheckpoint(ts, label); err != nil {
+			return nil, err
+		}
+	}
+
+	if err := s.replanOutlinesUnlocked(fromChapter, volumes, reason, &affected); err != nil {
+		return nil, err
+	}
+	if _, err := s.Checkpoints.AppendArtifact(domain.GlobalScope(), "replan_from_chapter", "layered_outline.json"); err != nil {
+		return nil, err
+	}
+	return affected, nil
+}
+
+func (s *Store) replanOutlinesUnlocked(fromChapter int, volumes []domain.VolumeOutline, reason string, affected *[]int) error {
+	s.Outline.io.mu.Lock()
+	defer s.Outline.io.mu.Unlock()
+
+	s.Progress.io.mu.Lock()
+	defer s.Progress.io.mu.Unlock()
+
+	p, err := s.Progress.loadUnlocked()
+	if err != nil {
+		return err
+	}
+	if p == nil || p.Phase != domain.PhaseWriting {
+		return fmt.Errorf("replan_from_chapter 仅允许在 writing 阶段调用: %w", errs.ErrToolPrecondition)
+	}
+	if len(p.PendingRewrites) > 0 {
+		return fmt.Errorf("已有返工队列，先处理完再 replan: %w", errs.ErrToolPrecondition)
+	}
+	if p.InProgressChapter > 0 {
+		return fmt.Errorf("有未完成章节，先提交或放弃再 replan: %w", errs.ErrToolPrecondition)
+	}
+	latestCompleted := p.LatestCompleted()
+	if total := domain.TotalChapters(volumes); total < latestCompleted {
+		return fmt.Errorf("新大纲章数不足以覆盖已完成高水位 %d: %w", latestCompleted, errs.ErrToolPrecondition)
+	}
+
+	*affected = make([]int, 0)
+	for ch := fromChapter; ch <= latestCompleted; ch++ {
+		*affected = append(*affected, ch)
+	}
+	// flow 合法性在写任何大纲文件之前校验：销毁性操作一旦校验失败必须零文件改动，
+	// 否则会留下“大纲已覆盖、progress 未动”的半落盘中间态。
+	switchFlow := len(*affected) > 0
+	if switchFlow {
+		if err := domain.ValidateFlowTransition(p.Flow, domain.FlowRewriting); err != nil {
+			return err
+		}
+	}
+
+	oldLayered, oldFlat, err := s.loadReplanOutlinesUnlocked()
+	if err != nil {
+		return err
+	}
+	if err := s.Outline.saveLayeredOutlineUnlocked(volumes); err != nil {
+		return err
+	}
+	restore := func() error { return s.restoreReplanOutlinesUnlocked(oldLayered, oldFlat) }
+	if err := s.Outline.saveOutlineUnlocked(domain.FlattenOutline(volumes)); err != nil {
+		if restoreErr := restore(); restoreErr != nil {
+			return fmt.Errorf("save outline failed and restore failed: %w; restore: %v", err, restoreErr)
+		}
+		return err
+	}
+
+	applyReplanProgress(p, fromChapter, volumes, *affected, reason)
+	if switchFlow {
+		p.Flow = domain.FlowRewriting
+	}
+	if err := s.Progress.saveUnlocked(p); err != nil {
+		if restoreErr := restore(); restoreErr != nil {
+			return fmt.Errorf("save progress failed and restore failed: %w; restore: %v", err, restoreErr)
+		}
+		return err
+	}
+	return nil
+}
+
+func (s *Store) loadReplanOutlinesUnlocked() ([]domain.VolumeOutline, []domain.OutlineEntry, error) {
+	layered, err := s.Outline.loadLayeredOutlineUnlocked()
+	if err != nil {
+		return nil, nil, err
+	}
+	flat, err := s.Outline.loadOutlineUnlocked()
+	if err != nil {
+		return nil, nil, err
+	}
+	return layered, flat, nil
+}
+
+func (s *Store) restoreReplanOutlinesUnlocked(layered []domain.VolumeOutline, flat []domain.OutlineEntry) error {
+	if err := s.Outline.saveLayeredOutlineUnlocked(layered); err != nil {
+		return err
+	}
+	return s.Outline.saveOutlineUnlocked(flat)
+}
+
+func mustLoadProgress(s *Store) *domain.Progress {
+	p, _ := s.Progress.Load()
+	return p
+}
+
+func applyReplanProgress(p *domain.Progress, fromChapter int, volumes []domain.VolumeOutline, affected []int, reason string) {
+	p.TotalChapters = domain.TotalChapters(volumes)
+	p.Layered = true
+	p.CompletedChapters = filterCompletedBefore(p.CompletedChapters, fromChapter)
+	p.StrandHistory = trimHistoryByChapter(p.StrandHistory, fromChapter)
+	p.HookHistory = trimHistoryByChapter(p.HookHistory, fromChapter)
+	p.ChapterWordCounts = trimChapterWordCounts(p.ChapterWordCounts, fromChapter)
+	p.TotalWordCount = sumChapterWordCounts(p.ChapterWordCounts)
+	p.InProgressChapter = 0
+	p.CompletedScenes = nil
+	p.CurrentChapter = fromChapter
+	p.PendingRewrites = affected
+	p.RewriteReason = reason
+	vol, arc, err := locateReplanChapter(volumes, fromChapter)
+	if err == nil {
+		p.CurrentVolume = vol
+		p.CurrentArc = arc
+	}
+}
+
+func filterCompletedBefore(chapters []int, fromChapter int) []int {
+	var kept []int
+	for _, ch := range chapters {
+		if ch < fromChapter {
+			kept = append(kept, ch)
+		}
+	}
+	return kept
+}
+
+func trimHistoryByChapter(history []string, fromChapter int) []string {
+	if len(history) >= fromChapter {
+		return slices.Clone(history[:fromChapter-1])
+	}
+	return slices.Clone(history)
+}
+
+func trimChapterWordCounts(counts map[int]int, fromChapter int) map[int]int {
+	if len(counts) == 0 {
+		return nil
+	}
+	kept := make(map[int]int, len(counts))
+	for chapter, count := range counts {
+		if chapter < fromChapter {
+			kept[chapter] = count
+		}
+	}
+	return kept
+}
+
+func sumChapterWordCounts(counts map[int]int) int {
+	total := 0
+	for _, count := range counts {
+		total += count
+	}
+	return total
+}
+
+func locateReplanChapter(volumes []domain.VolumeOutline, chapter int) (int, int, error) {
+	return locateChapter(volumes, chapter)
 }
 
 // ClearHandledSteer 原子性清除 PendingSteer 并重置 FlowSteering 状态

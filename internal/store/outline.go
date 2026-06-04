@@ -30,17 +30,32 @@ func (s *OutlineStore) LoadPremise() (string, error) {
 // SaveOutline 同时保存 outline.json 和 outline.md（原子写入）。
 func (s *OutlineStore) SaveOutline(entries []domain.OutlineEntry) error {
 	return s.io.WithWriteLock(func() error {
-		if err := s.io.WriteJSONUnlocked("outline.json", entries); err != nil {
-			return err
-		}
-		return s.io.WriteMarkdownUnlocked("outline.md", renderOutline(entries))
+		return s.saveOutlineUnlocked(entries)
 	})
+}
+
+func (s *OutlineStore) saveOutlineUnlocked(entries []domain.OutlineEntry) error {
+	if err := s.io.WriteJSONUnlocked("outline.json", entries); err != nil {
+		return err
+	}
+	return s.io.WriteMarkdownUnlocked("outline.md", renderOutline(entries))
 }
 
 // LoadOutline 从 outline.json 读取结构化大纲。
 func (s *OutlineStore) LoadOutline() ([]domain.OutlineEntry, error) {
 	var entries []domain.OutlineEntry
 	if err := s.io.ReadJSON("outline.json", &entries); err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return entries, nil
+}
+
+func (s *OutlineStore) loadOutlineUnlocked() ([]domain.OutlineEntry, error) {
+	var entries []domain.OutlineEntry
+	if err := s.io.ReadJSONUnlocked("outline.json", &entries); err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil
 		}
@@ -66,17 +81,32 @@ func (s *OutlineStore) GetChapterOutline(chapter int) (*domain.OutlineEntry, err
 // SaveLayeredOutline 保存分层大纲（长篇模式，原子写入）。
 func (s *OutlineStore) SaveLayeredOutline(volumes []domain.VolumeOutline) error {
 	return s.io.WithWriteLock(func() error {
-		if err := s.io.WriteJSONUnlocked("layered_outline.json", volumes); err != nil {
-			return err
-		}
-		return s.io.WriteMarkdownUnlocked("layered_outline.md", renderLayeredOutline(volumes))
+		return s.saveLayeredOutlineUnlocked(volumes)
 	})
+}
+
+func (s *OutlineStore) saveLayeredOutlineUnlocked(volumes []domain.VolumeOutline) error {
+	if err := s.io.WriteJSONUnlocked("layered_outline.json", volumes); err != nil {
+		return err
+	}
+	return s.io.WriteMarkdownUnlocked("layered_outline.md", renderLayeredOutline(volumes))
 }
 
 // LoadLayeredOutline 读取分层大纲。
 func (s *OutlineStore) LoadLayeredOutline() ([]domain.VolumeOutline, error) {
 	var volumes []domain.VolumeOutline
 	if err := s.io.ReadJSON("layered_outline.json", &volumes); err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return volumes, nil
+}
+
+func (s *OutlineStore) loadLayeredOutlineUnlocked() ([]domain.VolumeOutline, error) {
+	var volumes []domain.VolumeOutline
+	if err := s.io.ReadJSONUnlocked("layered_outline.json", &volumes); err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil
 		}
@@ -123,6 +153,18 @@ func (s *OutlineStore) LocateChapter(chapter int) (volume, arc int, err error) {
 	if err != nil {
 		return 0, 0, err
 	}
+	return locateChapter(volumes, chapter)
+}
+
+func (s *OutlineStore) locateChapterUnlocked(chapter int) (volume, arc int, err error) {
+	var volumes []domain.VolumeOutline
+	if err := s.io.ReadJSONUnlocked("layered_outline.json", &volumes); err != nil {
+		return 0, 0, err
+	}
+	return locateChapter(volumes, chapter)
+}
+
+func locateChapter(volumes []domain.VolumeOutline, chapter int) (volume, arc int, err error) {
 	ch := 1
 	for _, v := range volumes {
 		for _, a := range v.Arcs {

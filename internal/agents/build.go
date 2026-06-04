@@ -161,7 +161,7 @@ func BuildCoordinator(
 		StopAfterToolResult: func(toolName string, result json.RawMessage) bool {
 			r := decodeSaveFoundationResult(toolName, result)
 			switch r.Type {
-			case "update_compass", "expand_arc", "complete_book":
+			case "update_compass", "expand_arc", "complete_book", "replan_from_chapter":
 				return true
 			default:
 				return false
@@ -258,7 +258,9 @@ func BuildCoordinator(
 	agent := agentcore.NewAgent(
 		agentcore.WithModel(coordinatorModel),
 		agentcore.WithSystemPrompt(bundle.Prompts.Coordinator),
-		agentcore.WithTools(subagentTool, contextTool),
+		// askUser 是全书重规划确认门的依赖：coordinator 判定"整本书要重写"这类销毁性
+		// 操作后，必须先 ask_user 让用户确认，命中才派 architect 执行 replan_from_chapter。
+		agentcore.WithTools(subagentTool, contextTool, askUser),
 		agentcore.WithMaxTurns(100_000),
 		agentcore.WithOnMessage(coordinatorOnMessage),
 		agentcore.WithToolsAreIdempotent(true),

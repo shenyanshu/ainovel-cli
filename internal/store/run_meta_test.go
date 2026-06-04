@@ -249,7 +249,7 @@ func TestSaveCheckpoint(t *testing.T) {
 	_ = store.Progress.Init("test", 10)
 
 	progress, _ := store.Progress.Load()
-	if err := store.RunMeta.SaveCheckpoint("ch01-commit", progress); err != nil {
+	if _, err := store.RunMeta.SaveCheckpoint("ch01-commit", progress); err != nil {
 		t.Fatalf("SaveCheckpoint: %v", err)
 	}
 

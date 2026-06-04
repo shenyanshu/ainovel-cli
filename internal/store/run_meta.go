@@ -3,6 +3,7 @@ package store
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/voocel/ainovel-cli/internal/domain"
@@ -126,11 +127,33 @@ func (s *RunMetaStore) SetPlanningTier(tier domain.PlanningTier) error {
 
 // SaveCheckpoint 保存当前进度快照到 meta/checkpoints/。
 // progress 由调用方传入，避免跨域依赖。
-func (s *RunMetaStore) SaveCheckpoint(label string, progress *domain.Progress) error {
+func (s *RunMetaStore) SaveCheckpoint(label string, progress *domain.Progress) (string, error) {
 	if progress == nil {
-		return nil
+		return "", nil
 	}
 	ts := time.Now().Format("20060102-150405")
 	rel := fmt.Sprintf("meta/checkpoints/%s-%s.json", ts, label)
-	return s.io.WriteJSON(rel, progress)
+	return ts, s.io.WriteJSON(rel, progress)
+}
+
+// SaveReplanCheckpoint 只为重规划留痕，额外保存旧大纲快照，方便后续回溯排查。
+func (s *RunMetaStore) SaveReplanCheckpoint(ts, label string) error {
+	if ts == "" {
+		return nil
+	}
+	if err := s.copyCheckpointFile("layered_outline.json", filepath.Join("meta/checkpoints", ts+"-"+label+"-layered_outline.json")); err != nil {
+		return err
+	}
+	return s.copyCheckpointFile("outline.json", filepath.Join("meta/checkpoints", ts+"-"+label+"-outline.json"))
+}
+
+func (s *RunMetaStore) copyCheckpointFile(srcRel, dstRel string) error {
+	data, err := s.io.ReadFileUnlocked(srcRel)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	return s.io.WriteFileUnlocked(dstRel, data)
 }

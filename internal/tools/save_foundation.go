@@ -22,7 +22,7 @@ func NewSaveFoundationTool(store *store.Store) *SaveFoundationTool {
 
 func (t *SaveFoundationTool) Name() string { return "save_foundation" }
 func (t *SaveFoundationTool) Description() string {
-	return "保存小说基础设定（premise/outline/characters/world_rules/compass 等）。**这是唯一持久化入口**：未经此工具调用保存的内容不会进入 store，只在消息里输出 Markdown/JSON 等于丢失。参数固定为 {type, content, scale?, volume?, arc?}。type 可选 premise / outline / layered_outline / characters / world_rules / expand_arc / append_volume / update_compass / complete_book。premise 时 content 必须是 Markdown 字符串；其他类型 content 优先直接传 JSON 数组或对象。expand_arc 展开骨架弧的详细章节（需 volume + arc）；append_volume 追加新卷（content 为完整 VolumeOutline JSON，含弧结构）；update_compass 更新终局方向（content 为 StoryCompass JSON）；complete_book 宣告全书完结（content 传空对象 {}，直接推 Phase=Complete；调用前必须先通过终卷判定清单，且无返工队列）。scale 可选，仅允许 short / mid / long。"
+	return "保存小说基础设定（premise/outline/characters/world_rules/compass 等）。**这是唯一持久化入口**：未经此工具调用保存的内容不会进入 store，只在消息里输出 Markdown/JSON 等于丢失。参数固定为 {type, content, scale?, volume?, arc?, from_chapter?, reason?}。type 可选 premise / outline / layered_outline / characters / world_rules / expand_arc / append_volume / update_compass / complete_book / replan_from_chapter。premise 时 content 必须是 Markdown 字符串；其他类型 content 优先直接传 JSON 数组或对象。expand_arc 展开骨架弧的详细章节（需 volume + arc）；append_volume 追加新卷（content 为完整 VolumeOutline JSON，含弧结构）；replan_from_chapter 从指定章节开始重规划整本书（content 为完整 VolumeOutline JSON，from_chapter 默认 1，reason 可选）；update_compass 更新终局方向（content 为 StoryCompass JSON）；complete_book 宣告全书完结（content 传空对象 {}，直接推 Phase=Complete；调用前必须先通过终卷判定清单，且无返工队列）。scale 可选，仅允许 short / mid / long。"
 }
 func (t *SaveFoundationTool) Label() string { return "保存设定" }
 
@@ -32,23 +32,27 @@ func (t *SaveFoundationTool) ConcurrencySafe(_ json.RawMessage) bool { return fa
 
 func (t *SaveFoundationTool) Schema() map[string]any {
 	return schema.Object(
-		schema.Property("type", schema.Enum("设定类型", "premise", "outline", "layered_outline", "characters", "world_rules", "expand_arc", "append_volume", "update_compass", "complete_book")).Required(),
+		schema.Property("type", schema.Enum("设定类型", "premise", "outline", "layered_outline", "characters", "world_rules", "expand_arc", "append_volume", "update_compass", "complete_book", "replan_from_chapter")).Required(),
 		schema.Property("content", map[string]any{
 			"description": "内容。premise 传 Markdown 字符串；其他类型直接传 JSON 数组或对象即可，也兼容传 JSON 字符串。expand_arc 时传章节数组。",
 		}).Required(),
 		schema.Property("scale", schema.Enum("规划级别", "short", "mid", "long")),
 		schema.Property("volume", schema.Int("目标卷序号（仅 expand_arc 时必传）")),
 		schema.Property("arc", schema.Int("目标弧序号（仅 expand_arc 时必传）")),
+		schema.Property("from_chapter", schema.Int("重规划起始章节（仅 replan_from_chapter 时可选，默认 1）")),
+		schema.Property("reason", schema.String("重规划原因（仅 replan_from_chapter 时可选）")),
 	)
 }
 
 func (t *SaveFoundationTool) Execute(_ context.Context, args json.RawMessage) (json.RawMessage, error) {
 	var a struct {
-		Type    string          `json:"type"`
-		Content json.RawMessage `json:"content"`
-		Scale   string          `json:"scale"`
-		Volume  int             `json:"volume"`
-		Arc     int             `json:"arc"`
+		Type        string          `json:"type"`
+		Content     json.RawMessage `json:"content"`
+		Scale       string          `json:"scale"`
+		Volume      int             `json:"volume"`
+		Arc         int             `json:"arc"`
+		FromChapter int             `json:"from_chapter"`
+		Reason      string          `json:"reason"`
 	}
 	if err := json.Unmarshal(args, &a); err != nil {
 		return nil, fmt.Errorf("invalid args: %w: %w", errs.ErrToolArgs, err)
@@ -73,7 +77,7 @@ func (t *SaveFoundationTool) Execute(_ context.Context, args json.RawMessage) (j
 	// 写作阶段禁止全量覆盖大纲，只允许增量操作（expand_arc / append_volume）
 	if (a.Type == "outline" || a.Type == "layered_outline") && t.isWriting() {
 		return nil, fmt.Errorf(
-			"写作阶段禁止使用 %s 全量覆盖大纲。请使用 expand_arc 展开骨架弧，或 append_volume 追加新卷: %w", a.Type, errs.ErrToolPrecondition)
+			"写作阶段禁止使用 %s 全量覆盖大纲。请使用 expand_arc 展开骨架弧，或 append_volume 追加新卷；如需从某章起重写整本书，请用 replan_from_chapter: %w", a.Type, errs.ErrToolPrecondition)
 	}
 
 	decode := func(typeName string, out any) error {
@@ -185,6 +189,37 @@ func (t *SaveFoundationTool) Execute(_ context.Context, args json.RawMessage) (j
 		}
 		if chCount > 0 {
 			result["chapters"] = chCount
+		}
+
+	case "replan_from_chapter":
+		var volumes []domain.VolumeOutline
+		if err := decode("replan_from_chapter", &volumes); err != nil {
+			return nil, err
+		}
+		fromChapter := a.FromChapter
+		if fromChapter <= 0 {
+			fromChapter = 1
+		}
+		reason := a.Reason
+		if reason == "" {
+			reason = "用户发起全书重规划"
+		}
+		affected, err := t.store.ReplanFromChapter(fromChapter, volumes, reason)
+		if err != nil {
+			return nil, fmt.Errorf("replan from chapter: %w: %w", errs.ErrStoreWrite, err)
+		}
+		p, perr := t.store.Progress.Load()
+		if perr != nil {
+			return nil, fmt.Errorf("load progress after replan: %w: %w", errs.ErrStoreRead, perr)
+		}
+		result["from_chapter"] = fromChapter
+		result["affected_chapters"] = affected
+		result["pending_rewrites"] = []int{}
+		if len(affected) > 0 {
+			result["pending_rewrites"] = affected
+		}
+		if p != nil {
+			result["flow"] = string(p.Flow)
 		}
 
 	case "complete_book":

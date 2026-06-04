@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"testing"
 
 	"github.com/voocel/ainovel-cli/internal/domain"
@@ -283,6 +284,114 @@ func TestSaveFoundationAppendVolumeRejectsAfterComplete(t *testing.T) {
 	}
 }
 
+func TestSaveFoundationReplanFromChapterReturnsRealFlow(t *testing.T) {
+	dir := t.TempDir()
+	s := store.NewStore(dir)
+	if err := s.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if err := s.Progress.Init("test", 0); err != nil {
+		t.Fatalf("InitProgress: %v", err)
+	}
+	if err := s.Progress.UpdatePhase(domain.PhaseWriting); err != nil {
+		t.Fatalf("UpdatePhase: %v", err)
+	}
+	if err := s.Progress.Save(&domain.Progress{Phase: domain.PhaseWriting, CompletedChapters: []int{1, 2, 3}}); err != nil {
+		t.Fatalf("Save progress: %v", err)
+	}
+	if err := s.Outline.SaveOutline([]domain.OutlineEntry{{Chapter: 1, Title: "第一章"}, {Chapter: 2, Title: "第二章"}, {Chapter: 3, Title: "第三章"}}); err != nil {
+		t.Fatalf("SaveOutline: %v", err)
+	}
+	if err := s.Outline.SaveLayeredOutline([]domain.VolumeOutline{{Index: 1, Title: "第一卷", Arcs: []domain.ArcOutline{{Index: 1, EstimatedChapters: 3, Chapters: []domain.OutlineEntry{{Chapter: 1, Title: "第一章"}, {Chapter: 2, Title: "第二章"}, {Chapter: 3, Title: "第三章"}}}}}}); err != nil {
+		t.Fatalf("SaveLayeredOutline: %v", err)
+	}
+
+	tool := NewSaveFoundationTool(s)
+	args, err := json.Marshal(map[string]any{
+		"type":         "replan_from_chapter",
+		"from_chapter": 5,
+		"content": []map[string]any{{
+			"index": 1, "title": "第一卷", "theme": "起步",
+			"arcs": []map[string]any{{
+				"index": 1, "title": "首弧", "goal": "目标",
+				"chapters": []map[string]any{{"chapter": 1, "title": "第一章", "core_event": "开局", "hook": "继续"}, {"chapter": 2, "title": "第二章", "core_event": "推进", "hook": "继续"}, {"chapter": 3, "title": "第三章", "core_event": "收束", "hook": "继续"}},
+			}},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+
+	res, err := tool.Execute(context.Background(), args)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	var result map[string]any
+	if err := json.Unmarshal(res, &result); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if result["flow"] == string(domain.FlowRewriting) {
+		t.Fatalf("expected real flow instead of rewriting, got %v", result["flow"])
+	}
+	if rewrites, ok := result["pending_rewrites"].([]any); ok && len(rewrites) != 0 {
+		t.Fatalf("expected empty pending rewrites, got %v", rewrites)
+	}
+}
+
+func TestSaveFoundationReplanFromChapterSetsRewritingFlow(t *testing.T) {
+	dir := t.TempDir()
+	s := store.NewStore(dir)
+	if err := s.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if err := s.Progress.Init("test", 0); err != nil {
+		t.Fatalf("InitProgress: %v", err)
+	}
+	if err := s.Progress.UpdatePhase(domain.PhaseWriting); err != nil {
+		t.Fatalf("UpdatePhase: %v", err)
+	}
+	if err := s.Progress.Save(&domain.Progress{Phase: domain.PhaseWriting, CompletedChapters: []int{1, 2}}); err != nil {
+		t.Fatalf("Save progress: %v", err)
+	}
+	if err := s.Outline.SaveOutline([]domain.OutlineEntry{{Chapter: 1, Title: "第一章"}, {Chapter: 2, Title: "第二章"}}); err != nil {
+		t.Fatalf("SaveOutline: %v", err)
+	}
+	if err := s.Outline.SaveLayeredOutline([]domain.VolumeOutline{{Index: 1, Title: "第一卷", Arcs: []domain.ArcOutline{{Index: 1, EstimatedChapters: 2, Chapters: []domain.OutlineEntry{{Chapter: 1, Title: "第一章"}, {Chapter: 2, Title: "第二章"}}}}}}); err != nil {
+		t.Fatalf("SaveLayeredOutline: %v", err)
+	}
+
+	tool := NewSaveFoundationTool(s)
+	args, err := json.Marshal(map[string]any{
+		"type":         "replan_from_chapter",
+		"from_chapter": 1,
+		"content": []map[string]any{{
+			"index": 1, "title": "第一卷", "theme": "起步",
+			"arcs": []map[string]any{{
+				"index": 1, "title": "首弧", "goal": "目标",
+				"chapters": []map[string]any{{"chapter": 1, "title": "第一章", "core_event": "开局", "hook": "继续"}, {"chapter": 2, "title": "第二章", "core_event": "推进", "hook": "继续"}},
+			}},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+
+	res, err := tool.Execute(context.Background(), args)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	var result map[string]any
+	if err := json.Unmarshal(res, &result); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if result["flow"] != string(domain.FlowRewriting) {
+		t.Fatalf("expected rewriting flow, got %v", result["flow"])
+	}
+	if rewrites, ok := result["pending_rewrites"].([]any); !ok || len(rewrites) == 0 {
+		t.Fatalf("expected pending rewrites, got %v", result["pending_rewrites"])
+	}
+}
+
 func TestSaveFoundationUpdateCompass(t *testing.T) {
 	dir := t.TempDir()
 	s := store.NewStore(dir)
@@ -350,6 +459,258 @@ func TestSaveFoundationUpdateCompassOverridesLastUpdated(t *testing.T) {
 	if compass.LastUpdated != 5 {
 		t.Fatalf("expected LastUpdated=5 (max of CompletedChapters), got %d", compass.LastUpdated)
 	}
+}
+
+func TestSaveFoundationReplanFromChapter(t *testing.T) {
+	dir := t.TempDir()
+	s := store.NewStore(dir)
+	if err := s.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if err := s.Progress.Init("test", 8); err != nil {
+		t.Fatalf("InitProgress: %v", err)
+	}
+	progress, err := s.Progress.Load()
+	if err != nil {
+		t.Fatalf("LoadProgress: %v", err)
+	}
+	progress.Phase = domain.PhaseWriting
+	progress.Flow = domain.FlowWriting
+	progress.CompletedChapters = []int{1, 2, 3, 4, 5, 6, 7, 8}
+	progress.CurrentChapter = 9
+	progress.TotalChapters = 8
+	progress.TotalWordCount = 8000
+	progress.ChapterWordCounts = map[int]int{1: 1000, 2: 1000, 3: 1000, 4: 1000, 5: 1000, 6: 1000, 7: 1000, 8: 1000}
+	progress.StrandHistory = []string{"s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8"}
+	progress.HookHistory = []string{"h1", "h2", "h3", "h4", "h5", "h6", "h7", "h8"}
+	if err := s.Progress.Save(progress); err != nil {
+		t.Fatalf("SaveProgress: %v", err)
+	}
+	if err := s.Outline.SaveLayeredOutline(testReplanVolumes(8)); err != nil {
+		t.Fatalf("SaveLayeredOutline: %v", err)
+	}
+	if err := s.Outline.SaveOutline(domain.FlattenOutline(testReplanVolumes(8))); err != nil {
+		t.Fatalf("SaveOutline: %v", err)
+	}
+
+	tool := NewSaveFoundationTool(s)
+	args, err := json.Marshal(map[string]any{
+		"type":         "replan_from_chapter",
+		"content":      testReplanVolumes(8),
+		"from_chapter": 1,
+		"reason":       "整体重构",
+	})
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	res, err := tool.Execute(context.Background(), args)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	var result map[string]any
+	if err := json.Unmarshal(res, &result); err != nil {
+		t.Fatalf("Unmarshal result: %v", err)
+	}
+	if got := result["from_chapter"]; got != float64(1) {
+		t.Fatalf("expected from_chapter=1, got %v", got)
+	}
+	if got := result["flow"]; got != string(domain.FlowRewriting) {
+		t.Fatalf("expected flow rewriting, got %v", got)
+	}
+
+	updated, err := s.Progress.Load()
+	if err != nil {
+		t.Fatalf("LoadProgress2: %v", err)
+	}
+	if updated.Flow != domain.FlowRewriting {
+		t.Fatalf("expected rewriting flow, got %q", updated.Flow)
+	}
+	if len(updated.PendingRewrites) != 8 || updated.PendingRewrites[0] != 1 || updated.PendingRewrites[7] != 8 {
+		t.Fatalf("unexpected pending rewrites: %v", updated.PendingRewrites)
+	}
+	if len(updated.CompletedChapters) != 0 {
+		t.Fatalf("expected completed chapters cleared, got %v", updated.CompletedChapters)
+	}
+	if updated.CurrentChapter != 1 {
+		t.Fatalf("expected current chapter 1, got %d", updated.CurrentChapter)
+	}
+	if updated.TotalChapters != 8 {
+		t.Fatalf("expected total chapters 8, got %d", updated.TotalChapters)
+	}
+	if updated.TotalWordCount != 0 {
+		t.Fatalf("expected total word count 0, got %d", updated.TotalWordCount)
+	}
+}
+
+func TestSaveFoundationReplanFromChapterTrimsHistory(t *testing.T) {
+	dir := t.TempDir()
+	s := store.NewStore(dir)
+	if err := s.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if err := s.Progress.Init("test", 8); err != nil {
+		t.Fatalf("InitProgress: %v", err)
+	}
+	progress, _ := s.Progress.Load()
+	progress.Phase = domain.PhaseWriting
+	progress.Flow = domain.FlowWriting
+	progress.CompletedChapters = []int{1, 2, 3, 4, 5, 6, 7, 8}
+	progress.CurrentChapter = 9
+	progress.ChapterWordCounts = map[int]int{1: 100, 2: 200, 3: 300, 4: 400, 5: 500, 6: 600, 7: 700, 8: 800}
+	progress.TotalWordCount = 3600
+	progress.StrandHistory = []string{"s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8"}
+	progress.HookHistory = []string{"h1", "h2", "h3", "h4", "h5", "h6", "h7", "h8"}
+	if err := s.Progress.Save(progress); err != nil {
+		t.Fatalf("SaveProgress: %v", err)
+	}
+	if err := s.Outline.SaveLayeredOutline(testReplanVolumes(8)); err != nil {
+		t.Fatalf("SaveLayeredOutline: %v", err)
+	}
+	if err := s.Outline.SaveOutline(domain.FlattenOutline(testReplanVolumes(8))); err != nil {
+		t.Fatalf("SaveOutline: %v", err)
+	}
+
+	tool := NewSaveFoundationTool(s)
+	args, _ := json.Marshal(map[string]any{"type": "replan_from_chapter", "content": testReplanVolumes(8), "from_chapter": 5})
+	if _, err := tool.Execute(context.Background(), args); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	updated, _ := s.Progress.Load()
+	if len(updated.PendingRewrites) != 4 || updated.PendingRewrites[0] != 5 || updated.PendingRewrites[3] != 8 {
+		t.Fatalf("unexpected pending rewrites: %v", updated.PendingRewrites)
+	}
+	if got := updated.CompletedChapters; len(got) != 4 || got[0] != 1 || got[3] != 4 {
+		t.Fatalf("unexpected completed chapters: %v", got)
+	}
+	if len(updated.ChapterWordCounts) != 4 || updated.TotalWordCount != 1000 {
+		t.Fatalf("unexpected word counts: %+v total=%d", updated.ChapterWordCounts, updated.TotalWordCount)
+	}
+	if len(updated.StrandHistory) != 4 || len(updated.HookHistory) != 4 {
+		t.Fatalf("unexpected history trim: strand=%v hook=%v", updated.StrandHistory, updated.HookHistory)
+	}
+}
+
+func TestSaveFoundationReplanFromChapterValidation(t *testing.T) {
+	dir := t.TempDir()
+	s := store.NewStore(dir)
+	if err := s.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if err := s.Progress.Init("test", 8); err != nil {
+		t.Fatalf("InitProgress: %v", err)
+	}
+	progress, _ := s.Progress.Load()
+	progress.Phase = domain.PhaseComplete
+	if err := s.Progress.Save(progress); err != nil {
+		t.Fatalf("SaveProgress: %v", err)
+	}
+
+	tool := NewSaveFoundationTool(s)
+	args, _ := json.Marshal(map[string]any{"type": "replan_from_chapter", "content": testReplanVolumes(8), "from_chapter": 1})
+	if _, err := tool.Execute(context.Background(), args); err == nil {
+		t.Fatal("expected error when replan in complete phase")
+	}
+	after, _ := s.Progress.Load()
+	if after.Phase != domain.PhaseComplete {
+		t.Fatalf("expected progress unchanged, got phase=%q", after.Phase)
+	}
+}
+
+func TestSaveFoundationReplanFromChapterRejectedByPendingQueue(t *testing.T) {
+	dir := t.TempDir()
+	s := store.NewStore(dir)
+	if err := s.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if err := s.Progress.Init("test", 8); err != nil {
+		t.Fatalf("InitProgress: %v", err)
+	}
+	progress, _ := s.Progress.Load()
+	progress.Phase = domain.PhaseWriting
+	progress.Flow = domain.FlowWriting
+	progress.PendingRewrites = []int{2}
+	if err := s.Progress.Save(progress); err != nil {
+		t.Fatalf("SaveProgress: %v", err)
+	}
+
+	tool := NewSaveFoundationTool(s)
+	args, _ := json.Marshal(map[string]any{"type": "replan_from_chapter", "content": testReplanVolumes(8), "from_chapter": 1})
+	if _, err := tool.Execute(context.Background(), args); err == nil {
+		t.Fatal("expected error when pending rewrites exist")
+	}
+}
+
+func TestSaveFoundationReplanFromChapterCapacityValidation(t *testing.T) {
+	dir := t.TempDir()
+	s := store.NewStore(dir)
+	if err := s.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if err := s.Progress.Init("test", 8); err != nil {
+		t.Fatalf("InitProgress: %v", err)
+	}
+	progress, _ := s.Progress.Load()
+	progress.Phase = domain.PhaseWriting
+	progress.Flow = domain.FlowWriting
+	progress.CompletedChapters = []int{1, 2, 3, 4, 5, 6, 7, 8}
+	if err := s.Progress.Save(progress); err != nil {
+		t.Fatalf("SaveProgress: %v", err)
+	}
+
+	tool := NewSaveFoundationTool(s)
+	args, _ := json.Marshal(map[string]any{"type": "replan_from_chapter", "content": testReplanVolumes(4), "from_chapter": 1})
+	if _, err := tool.Execute(context.Background(), args); err == nil {
+		t.Fatal("expected error when new outline cannot cover completed high water mark")
+	}
+	after, _ := s.Progress.Load()
+	if len(after.PendingRewrites) != 0 || after.Flow != domain.FlowWriting {
+		t.Fatalf("expected progress unchanged, got %+v", after)
+	}
+}
+
+func TestSaveFoundationReplanFromChapterKeepsLaterOutlineChanges(t *testing.T) {
+	dir := t.TempDir()
+	s := store.NewStore(dir)
+	if err := s.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if err := s.Progress.Init("test", 8); err != nil {
+		t.Fatalf("InitProgress: %v", err)
+	}
+	progress, _ := s.Progress.Load()
+	progress.Phase = domain.PhaseWriting
+	progress.Flow = domain.FlowWriting
+	progress.CompletedChapters = []int{1, 2, 3, 4, 5, 6, 7, 8}
+	progress.CurrentChapter = 9
+	if err := s.Progress.Save(progress); err != nil {
+		t.Fatalf("SaveProgress: %v", err)
+	}
+	volumes := testReplanVolumes(10)
+	if err := s.Outline.SaveLayeredOutline(volumes); err != nil {
+		t.Fatalf("SaveLayeredOutline: %v", err)
+	}
+	if err := s.Outline.SaveOutline(domain.FlattenOutline(volumes)); err != nil {
+		t.Fatalf("SaveOutline: %v", err)
+	}
+	tool := NewSaveFoundationTool(s)
+	args, _ := json.Marshal(map[string]any{"type": "replan_from_chapter", "content": volumes, "from_chapter": 5})
+	res, err := tool.Execute(context.Background(), args)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	var result map[string]any
+	_ = json.Unmarshal(res, &result)
+	if got := result["affected_chapters"]; got == nil {
+		t.Fatal("expected affected chapters in result")
+	}
+}
+
+func testReplanVolumes(totalChapters int) []domain.VolumeOutline {
+	chapters := make([]domain.OutlineEntry, 0, totalChapters)
+	for i := 1; i <= totalChapters; i++ {
+		chapters = append(chapters, domain.OutlineEntry{Title: fmt.Sprintf("第%d章", i), CoreEvent: "事件"})
+	}
+	return []domain.VolumeOutline{{Index: 1, Title: "第一卷", Theme: "主题", Arcs: []domain.ArcOutline{{Index: 1, Title: "首弧", Goal: "目标", Chapters: chapters}}}}
 }
 
 func TestSaveFoundationUpdateCompassRequiresDirection(t *testing.T) {
