@@ -7,7 +7,12 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/voocel/ainovel-cli/internal/host"
+	"github.com/voocel/ainovel-cli/internal/utils"
 )
+
+// customModelOption 是模型候选列表末尾的“自定义”哨兵项标签。
+// 选中它后允许直接输入一个未登记的新模型名，解决新 provider 候选为空时无法分配模型的问题。
+const customModelOption = "+ 自定义…"
 
 type modelSwitchFocus int
 
@@ -38,6 +43,8 @@ type modelSwitchState struct {
 	providers   []string
 	models      []string
 	message     string
+	typing      bool   // 是否处于自定义模型名输入态
+	customInput string // 自定义模型名输入缓冲
 }
 
 func newModelSwitchState(rt *host.Host, roleHint string) *modelSwitchState {
@@ -135,11 +142,10 @@ func (s *modelSwitchState) syncSelection(rt *host.Host) {
 }
 
 func (s *modelSwitchState) syncModels(rt *host.Host, preferred string) {
-	s.models = rt.ConfiguredModels(s.provider())
+	// 候选列表末尾恒定追加“自定义”哨兵项，使任何 provider（含候选为空的新 provider）
+	// 都能进入手动输入分配新模型。
+	s.models = append(rt.ConfiguredModels(s.provider()), customModelOption)
 	s.modelIdx = 0
-	if len(s.models) == 0 {
-		return
-	}
 	preferred = strings.TrimSpace(preferred)
 	for i, model := range s.models {
 		if model == preferred {
@@ -149,14 +155,26 @@ func (s *modelSwitchState) syncModels(rt *host.Host, preferred string) {
 	}
 }
 
+// isCustomSelected 判断模型字段当前是否停在“自定义”哨兵项上。
+func (s *modelSwitchState) isCustomSelected() bool {
+	return s.model() == customModelOption
+}
+
 func (s *modelSwitchState) apply(rt *host.Host) error {
 	if len(s.providers) == 0 {
 		return fmt.Errorf("当前没有可用 provider")
 	}
-	if len(s.models) == 0 {
+	model := s.model()
+	if model == customModelOption {
+		model = utils.CleanInputLine(s.customInput)
+		if model == "" {
+			return fmt.Errorf("请输入模型名")
+		}
+	}
+	if model == "" {
 		return fmt.Errorf("provider %q 没有已配置模型", s.provider())
 	}
-	return rt.SwitchModel(s.role(), s.provider(), s.model())
+	return rt.SwitchModel(s.role(), s.provider(), model)
 }
 
 func (m Model) handleModelSwitchKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -164,6 +182,10 @@ func (m Model) handleModelSwitchKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	state := m.modelSwitch
+
+	if state.typing {
+		return m.handleCustomModelKey(msg, state)
+	}
 
 	switch msg.Type {
 	case tea.KeyEsc:
@@ -185,18 +207,53 @@ func (m Model) handleModelSwitchKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		state.cycle(1, m.runtime)
 		return m, nil
 	case tea.KeyEnter:
-		if err := state.apply(m.runtime); err != nil {
-			state.message = err.Error()
+		// 只要当前模型选中“自定义”哨兵项，Enter 就先进入输入态而非直接应用。
+		if state.isCustomSelected() {
+			state.typing = true
+			state.message = ""
 			return m, nil
 		}
-		m.modelSwitch = nil
-		if m.mode != modeDone {
-			return m, tea.Batch(m.textarea.Focus(), fetchSnapshot(m.runtime))
-		}
-		return m, fetchSnapshot(m.runtime)
+		return m.applyModelSwitch(state)
 	default:
 		return m, nil
 	}
+}
+
+// handleCustomModelKey 处理自定义模型名输入态下的按键。
+func (m Model) handleCustomModelKey(msg tea.KeyMsg, state *modelSwitchState) (tea.Model, tea.Cmd) {
+	switch msg.Type {
+	case tea.KeyEsc:
+		state.typing = false
+		state.customInput = ""
+		state.message = ""
+		return m, nil
+	case tea.KeyEnter:
+		return m.applyModelSwitch(state)
+	case tea.KeyBackspace:
+		if n := len(state.customInput); n > 0 {
+			runes := []rune(state.customInput)
+			state.customInput = string(runes[:len(runes)-1])
+		}
+		return m, nil
+	case tea.KeyRunes, tea.KeySpace:
+		state.customInput += utils.CleanInputRunes(msg.Runes)
+		return m, nil
+	default:
+		return m, nil
+	}
+}
+
+// applyModelSwitch 应用当前选择并关闭切换框，失败时把错误回显在框内。
+func (m Model) applyModelSwitch(state *modelSwitchState) (tea.Model, tea.Cmd) {
+	if err := state.apply(m.runtime); err != nil {
+		state.message = err.Error()
+		return m, nil
+	}
+	m.modelSwitch = nil
+	if m.mode != modeDone {
+		return m, tea.Batch(m.textarea.Focus(), fetchSnapshot(m.runtime))
+	}
+	return m, fetchSnapshot(m.runtime)
 }
 
 func renderModelSwitchBar(width int, state *modelSwitchState) string {
@@ -211,11 +268,19 @@ func renderModelSwitchBar(width int, state *modelSwitchState) string {
 
 	row1 := renderModelField("角色", state.roleLabel(), state.focus == modelFocusRole)
 	row2 := renderModelField("Provider", state.provider(), state.focus == modelFocusProvider)
-	row3 := renderModelField("模型", state.model(), state.focus == modelFocusModel)
+	modelValue := state.model()
+	if state.typing {
+		modelValue = state.customInput + "▏"
+	}
+	row3 := renderModelField("模型", modelValue, state.focus == modelFocusModel)
+	hintText := "Tab 切字段   ←→ 切选项   Enter 应用   Esc 取消"
+	if state.typing {
+		hintText = "输入模型名   Enter 确认   Esc 返回"
+	}
 	hint := lipgloss.NewStyle().
 		Foreground(colorDim).
 		Italic(true).
-		Render("Tab 切字段   ←→ 切选项   Enter 应用   Esc 取消")
+		Render(hintText)
 	lines := []string{
 		row1,
 		row2,

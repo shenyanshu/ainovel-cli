@@ -338,6 +338,28 @@ func (c Config) CandidateModels(provider string) []string {
 	return models
 }
 
+// RememberModel 把切换实际用到的模型登记进 provider.models。
+// 用途：TUI 中输入一个未登记的新模型并切换后，下次 /model 能在候选列表直接选到它，
+// 不必再手动编辑配置文件。provider 不存在或模型已登记时是无操作。
+func (c *Config) RememberModel(provider, model string) {
+	provider = strings.TrimSpace(provider)
+	model = strings.TrimSpace(model)
+	if provider == "" || model == "" {
+		return
+	}
+	pc, ok := c.Providers[provider]
+	if !ok {
+		return
+	}
+	for _, existing := range pc.Models {
+		if existing == model {
+			return
+		}
+	}
+	pc.Models = append(pc.Models, model)
+	c.Providers[provider] = pc
+}
+
 func (c Config) validateModelRef(owner string, ref ModelRef) error {
 	if ref.Provider == "" || ref.Model == "" {
 		return fmt.Errorf("%s must have both provider and model: %w", owner, errs.ErrConfig)

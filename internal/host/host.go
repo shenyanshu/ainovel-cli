@@ -726,6 +726,8 @@ func (h *Host) SwitchModel(role, provider, model string) error {
 		rc.Model = model
 		h.cfg.Roles[role] = rc
 	}
+	// 把切换用到的模型登记进 provider.models，使 TUI 输入的新模型成为后续候选。
+	h.cfg.RememberModel(provider, model)
 	if path := bootstrap.DefaultConfigPath(); path != "" {
 		if err := bootstrap.SaveConfig(path, h.cfg); err != nil {
 			slog.Warn("保存配置失败", "module", "host", "err", err)
