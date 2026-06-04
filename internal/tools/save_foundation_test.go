@@ -590,7 +590,9 @@ func TestSaveFoundationReplanFromChapterTrimsHistory(t *testing.T) {
 	}
 }
 
-func TestSaveFoundationReplanFromChapterValidation(t *testing.T) {
+// progress 未初始化（init/premise/outline 等非 writing/complete 阶段）时 replan 应被拒。
+// 注意 complete 阶段是允许的（解冻路径，见 UnfreezesCompleted），这里覆盖的是另一侧边界。
+func TestSaveFoundationReplanFromChapterRejectsNonWritingPhase(t *testing.T) {
 	dir := t.TempDir()
 	s := store.NewStore(dir)
 	if err := s.Init(); err != nil {
@@ -600,7 +602,7 @@ func TestSaveFoundationReplanFromChapterValidation(t *testing.T) {
 		t.Fatalf("InitProgress: %v", err)
 	}
 	progress, _ := s.Progress.Load()
-	progress.Phase = domain.PhaseComplete
+	progress.Phase = domain.PhaseOutline
 	if err := s.Progress.Save(progress); err != nil {
 		t.Fatalf("SaveProgress: %v", err)
 	}
@@ -608,10 +610,10 @@ func TestSaveFoundationReplanFromChapterValidation(t *testing.T) {
 	tool := NewSaveFoundationTool(s)
 	args, _ := json.Marshal(map[string]any{"type": "replan_from_chapter", "content": testReplanVolumes(8), "from_chapter": 1})
 	if _, err := tool.Execute(context.Background(), args); err == nil {
-		t.Fatal("expected error when replan in complete phase")
+		t.Fatal("expected error when replan in non-writing/non-complete phase")
 	}
 	after, _ := s.Progress.Load()
-	if after.Phase != domain.PhaseComplete {
+	if after.Phase != domain.PhaseOutline {
 		t.Fatalf("expected progress unchanged, got phase=%q", after.Phase)
 	}
 }
@@ -637,6 +639,147 @@ func TestSaveFoundationReplanFromChapterRejectedByPendingQueue(t *testing.T) {
 	args, _ := json.Marshal(map[string]any{"type": "replan_from_chapter", "content": testReplanVolumes(8), "from_chapter": 1})
 	if _, err := tool.Execute(context.Background(), args); err == nil {
 		t.Fatal("expected error when pending rewrites exist")
+	}
+}
+
+// 死锁回归：用户正写着第 5 章（in-progress）时发现要从头重写，replan 必须放行，
+// 而不是被"有未完成章节"挡死。这是线上报的核心 bug。
+func TestSaveFoundationReplanFromChapterAllowsInProgressWithinRange(t *testing.T) {
+	dir := t.TempDir()
+	s := store.NewStore(dir)
+	if err := s.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if err := s.Progress.Init("test", 8); err != nil {
+		t.Fatalf("InitProgress: %v", err)
+	}
+	progress, _ := s.Progress.Load()
+	progress.Phase = domain.PhaseWriting
+	progress.Flow = domain.FlowWriting
+	progress.CompletedChapters = []int{1, 2, 3, 4}
+	progress.InProgressChapter = 5
+	if err := s.Progress.Save(progress); err != nil {
+		t.Fatalf("SaveProgress: %v", err)
+	}
+
+	tool := NewSaveFoundationTool(s)
+	args, _ := json.Marshal(map[string]any{"type": "replan_from_chapter", "content": testReplanVolumes(8), "from_chapter": 1})
+	if _, err := tool.Execute(context.Background(), args); err != nil {
+		t.Fatalf("expected replan to succeed with in-progress chapter, got: %v", err)
+	}
+	after, _ := s.Progress.Load()
+	if after.InProgressChapter != 0 {
+		t.Fatalf("expected in-progress cleared, got %d", after.InProgressChapter)
+	}
+	if after.Flow != domain.FlowRewriting {
+		t.Fatalf("expected rewriting flow, got %s", after.Flow)
+	}
+	if len(after.PendingRewrites) != 4 {
+		t.Fatalf("expected 4 pending rewrites, got %v", after.PendingRewrites)
+	}
+}
+
+// 边界：正写第 5 章且 replan 起点正好是第 5 章（latestCompleted=4）。affected 为空、
+// 不切 rewriting，但 in-progress 被清空，下一步由 Router 从第 5 章全新重写。
+func TestSaveFoundationReplanFromChapterInProgressEqualsStart(t *testing.T) {
+	dir := t.TempDir()
+	s := store.NewStore(dir)
+	if err := s.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if err := s.Progress.Init("test", 8); err != nil {
+		t.Fatalf("InitProgress: %v", err)
+	}
+	progress, _ := s.Progress.Load()
+	progress.Phase = domain.PhaseWriting
+	progress.Flow = domain.FlowWriting
+	progress.CompletedChapters = []int{1, 2, 3, 4}
+	progress.InProgressChapter = 5
+	if err := s.Progress.Save(progress); err != nil {
+		t.Fatalf("SaveProgress: %v", err)
+	}
+
+	tool := NewSaveFoundationTool(s)
+	args, _ := json.Marshal(map[string]any{"type": "replan_from_chapter", "content": testReplanVolumes(8), "from_chapter": 5})
+	if _, err := tool.Execute(context.Background(), args); err != nil {
+		t.Fatalf("expected replan to succeed, got: %v", err)
+	}
+	after, _ := s.Progress.Load()
+	if after.InProgressChapter != 0 {
+		t.Fatalf("expected in-progress cleared, got %d", after.InProgressChapter)
+	}
+	if len(after.PendingRewrites) != 0 {
+		t.Fatalf("expected no pending rewrites, got %v", after.PendingRewrites)
+	}
+	if after.NextChapter() != 5 {
+		t.Fatalf("expected next chapter 5, got %d", after.NextChapter())
+	}
+}
+
+// 拒绝：正写第 3 章却想从第 5 章起 replan，会丢弃未被覆盖的第 3 章半成品，
+// 在新大纲里留下"存在却永不重写"的空洞，必须拒绝且 progress 不变。
+func TestSaveFoundationReplanFromChapterRejectsStartAfterInProgress(t *testing.T) {
+	dir := t.TempDir()
+	s := store.NewStore(dir)
+	if err := s.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if err := s.Progress.Init("test", 8); err != nil {
+		t.Fatalf("InitProgress: %v", err)
+	}
+	progress, _ := s.Progress.Load()
+	progress.Phase = domain.PhaseWriting
+	progress.Flow = domain.FlowWriting
+	progress.CompletedChapters = []int{1, 2}
+	progress.InProgressChapter = 3
+	if err := s.Progress.Save(progress); err != nil {
+		t.Fatalf("SaveProgress: %v", err)
+	}
+
+	tool := NewSaveFoundationTool(s)
+	args, _ := json.Marshal(map[string]any{"type": "replan_from_chapter", "content": testReplanVolumes(8), "from_chapter": 5})
+	if _, err := tool.Execute(context.Background(), args); err == nil {
+		t.Fatal("expected error when replan starts after in-progress chapter")
+	}
+	after, _ := s.Progress.Load()
+	if after.InProgressChapter != 3 || len(after.PendingRewrites) != 0 || after.Flow != domain.FlowWriting {
+		t.Fatalf("expected progress unchanged, got %+v", after)
+	}
+}
+
+// 解冻：书已被（误）标完结后，用户要全书重写。replan 必须能在 complete 阶段执行，
+// 并把 Phase 复位回 writing——否则误标完结会导致全书永久冻结、无法补救。
+func TestSaveFoundationReplanFromChapterUnfreezesCompleted(t *testing.T) {
+	dir := t.TempDir()
+	s := store.NewStore(dir)
+	if err := s.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if err := s.Progress.Init("test", 8); err != nil {
+		t.Fatalf("InitProgress: %v", err)
+	}
+	progress, _ := s.Progress.Load()
+	progress.Phase = domain.PhaseComplete
+	progress.Flow = domain.FlowWriting
+	progress.CompletedChapters = []int{1, 2, 3, 4, 5, 6, 7, 8}
+	if err := s.Progress.Save(progress); err != nil {
+		t.Fatalf("SaveProgress: %v", err)
+	}
+
+	tool := NewSaveFoundationTool(s)
+	args, _ := json.Marshal(map[string]any{"type": "replan_from_chapter", "content": testReplanVolumes(8), "from_chapter": 1})
+	if _, err := tool.Execute(context.Background(), args); err != nil {
+		t.Fatalf("expected replan to unfreeze completed book, got: %v", err)
+	}
+	after, _ := s.Progress.Load()
+	if after.Phase != domain.PhaseWriting {
+		t.Fatalf("expected phase reset to writing, got %s", after.Phase)
+	}
+	if after.Flow != domain.FlowRewriting {
+		t.Fatalf("expected rewriting flow, got %s", after.Flow)
+	}
+	if len(after.PendingRewrites) != 8 {
+		t.Fatalf("expected 8 pending rewrites, got %v", after.PendingRewrites)
 	}
 }
 

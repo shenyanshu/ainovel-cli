@@ -229,14 +229,23 @@ func (s *Store) replanOutlinesUnlocked(fromChapter int, volumes []domain.VolumeO
 	if err != nil {
 		return err
 	}
-	if p == nil || p.Phase != domain.PhaseWriting {
-		return fmt.Errorf("replan_from_chapter 仅允许在 writing 阶段调用: %w", errs.ErrToolPrecondition)
+	// 允许 writing 或 complete：complete 是 replan 唯一的"解冻"入口。
+	// Phase 转移规则只前进不回退，一旦 complete_book 误标完结，全书会被永久冻结
+	// （append_volume/edit/普通 replan 全被拒）。replan 是带确认门和全套一致性校验的
+	// 受控事务，由它承载这唯一一条受控逆转：complete → writing（在事务内复位，见下）。
+	if p == nil || (p.Phase != domain.PhaseWriting && p.Phase != domain.PhaseComplete) {
+		return fmt.Errorf("replan_from_chapter 仅允许在 writing 或 complete 阶段调用: %w", errs.ErrToolPrecondition)
 	}
 	if len(p.PendingRewrites) > 0 {
 		return fmt.Errorf("已有返工队列，先处理完再 replan: %w", errs.ErrToolPrecondition)
 	}
-	if p.InProgressChapter > 0 {
-		return fmt.Errorf("有未完成章节，先提交或放弃再 replan: %w", errs.ErrToolPrecondition)
+	// 用户通常正写着某章才发现要重写，此刻必然有 in-progress 章节，replan 会清空它
+	// 并把该章纳入返工，等价于"放弃当前草稿"——所以不能一刀切拒绝，否则形成无出口死锁。
+	// 仅当 replan 起点在 in-progress 章节之后时才拒绝：那会丢弃一个未被覆盖的半成品章节，
+	// 在新大纲里留下"存在却永不重写"的空洞，语义不正确。
+	if p.InProgressChapter > 0 && fromChapter > p.InProgressChapter {
+		return fmt.Errorf("第 %d 章仍在写作中，replan 起点不能晚于它；请从第 %d 章或更早开始，或先提交/放弃当前章节: %w",
+			p.InProgressChapter, p.InProgressChapter, errs.ErrToolPrecondition)
 	}
 	latestCompleted := p.LatestCompleted()
 	if total := domain.TotalChapters(volumes); total < latestCompleted {
@@ -309,6 +318,10 @@ func mustLoadProgress(s *Store) *domain.Progress {
 }
 
 func applyReplanProgress(p *domain.Progress, fromChapter int, volumes []domain.VolumeOutline, affected []int, reason string) {
+	// 解冻：若书已被（误）标完结，replan 把 Phase 直接复位到 writing。
+	// 这里绕过 UpdatePhase/ValidatePhaseTransition 的"只前进不回退"规则是有意为之——
+	// complete→writing 是全书唯一受控逆转，仅由这条带确认门的销毁性 replan 路径触发。
+	p.Phase = domain.PhaseWriting
 	p.TotalChapters = domain.TotalChapters(volumes)
 	p.Layered = true
 	p.CompletedChapters = filterCompletedBefore(p.CompletedChapters, fromChapter)
